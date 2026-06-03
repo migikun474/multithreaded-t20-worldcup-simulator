@@ -1,4 +1,4 @@
-# 🏏 Multithreaded T20 Cricket World Cup Simulator
+#  Multithreaded T20 Cricket World Cup Simulator
 
 > 
 > **Language:** C++17 with POSIX Threads  
