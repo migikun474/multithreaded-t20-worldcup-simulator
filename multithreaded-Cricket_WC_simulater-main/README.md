@@ -1,435 +1,640 @@
-# T20 World Cup Cricket Simulator (India Innings)
+# 🏏 Multithreaded T20 Cricket World Cup Simulator
 
-A multi-threaded **C++17 + POSIX threads** simulator that models a T20 cricket innings (India batting vs England bowling) as an Operating Systems concurrency problem.
+> **Course:** Operating Systems (CSC-204)  
+> **Language:** C++17 with POSIX Threads  
+> **Match:** India 🇮🇳 vs England 🏴󠁧󠁢󠁥󠁮󠁧󠁿 — T20 World Cup Final
 
-The project maps cricket entities to OS primitives:
-- **Players as threads** (bowler, batsmen slots, fielders, umpire, scheduler, logger, commentator)
-- **Pitch as critical section**
-- **Events as producer-consumer queues**
-- **Deadlock detection** with a Banker-style `Available/Allocation/Request` safety check
-- **Scheduling** policies (Round Robin phase-quota, SJF, Priority phase-quota)
+A full two-innings T20 cricket match simulated entirely via concurrent OS-level threads. Every player on the pitch is a live thread. Every ball is a synchronised event. Scheduling algorithms, deadlock detection, and inter-thread communication are all demonstrated in the context of a real cricket match.
 
 ---
 
 ## Table of Contents
-- [1. What this simulator models](#1-what-this-simulator-models)
-- [2. High-level architecture](#2-high-level-architecture)
-- [3. Thread model and synchronization](#3-thread-model-and-synchronization)
-- [4. End-to-end innings workflow](#4-end-to-end-innings-workflow)
-- [5. Scheduling algorithms](#5-scheduling-algorithms)
-- [6. Probability and cricket mechanics model](#6-probability-and-cricket-mechanics-model)
-- [7. Deadlock detection design](#7-deadlock-detection-design)
-- [8. Logging and analytics pipeline](#8-logging-and-analytics-pipeline)
-- [9. Build, run, and analysis](#9-build-run-and-analysis)
-- [10. Data structures (core structs)](#10-data-structures-core-structs)
-- [11. Assumptions implemented](#11-assumptions-implemented)
+
+1. [Project Overview](#1-project-overview)
+2. [Repository Structure](#2-repository-structure)
+3. [Architecture Overview](#3-architecture-overview)
+4. [Thread Design](#4-thread-design)
+5. [Synchronisation & Concurrency](#5-synchronisation--concurrency)
+6. [Scheduling Algorithms](#6-scheduling-algorithms)
+7. [Event System](#7-event-system)
+8. [Deadlock Detection](#8-deadlock-detection)
+9. [Probability & Simulation Models](#9-probability--simulation-models)
+10. [Output & Logging](#10-output--logging)
+11. [Analysis Tools](#11-analysis-tools)
+12. [Build & Run](#12-build--run)
+13. [Key OS Concepts Demonstrated](#13-key-os-concepts-demonstrated)
 
 ---
 
-## 1. What this simulator models
+## 1. Project Overview
 
-- Single T20 innings (maximum **20 overs** or **10 wickets**).
-- India batting lineup of 11 players, England bowling attack of 5 bowlers, and 10 fielders.
-- Match flow with realistic outcomes and cricket laws: wides, no-balls, free-hit behavior, catches, run-outs, overthrows, powerplay field restrictions, strike rotation.
-- Continuous system-level telemetry through text/CSV/commentary logs.
+This simulator maps a cricket T20 match onto operating systems concepts:
+
+| Cricket Role | OS Concept |
+|---|---|
+| Batsman | User-space thread waiting on a resource (the ball) |
+| Bowler | Thread that produces a shared resource (ball delivery) |
+| Fielder | 10 concurrent threads competing for the same event (aerial ball) |
+| Umpire | Monitor/watchdog thread — also runs the deadlock detector |
+| Scheduler | Thread that implements CPU scheduling algorithms for bowler rotation |
+| Logger | Single-writer consumer draining the shared event queue |
+| Commentator | Pipeline stage: consumes one queue, produces to another |
+
+The full match runs two innings. Between them, teams swap roles. The final result (win/loss/tie) is printed after both innings complete.
 
 ---
 
-## 2. High-level architecture
+## 2. Repository Structure
 
-```mermaid
-flowchart LR
-    M[main.cpp\nBootstraps match state] --> B[bowler_thread]
-    M --> BA[batsman_thread x2]
-    M --> F[fielder_thread x10]
-    M --> S[scheduler_thread]
-    M --> U[umpire_thread]
-    M --> L[logger_thread]
-    M --> C[commentator_thread]
-
-    B -->|events| EQ[(g_event_queue)]
-    BA -->|events| EQ
-    F -->|events| EQ
-
-    B -->|commentary events| CQ[(g_commentary_queue)]
-    BA -->|commentary events| CQ
-    F -->|commentary events| CQ
-
-    CQ --> C
-    C -->|EVT_COMMENTARY| EQ
-    EQ --> L
-
-    U -->|deadlock polling| MS[(MatchState matrices)]
-    S --> MS
-    B --> PM[(PitchMonitor\ncritical section)]
 ```
-
-### Subsystem map
-
-- **Core state/sync**: `include/match_state.h`, `src/core/match_state.cpp`
-- **Event transport**: `include/event.h`, `src/core/event_queue.cpp`
-- **Pitch monitor**: `include/pitch_monitor.h`, `src/core/pitch_monitor.cpp`
-- **Player model**: `include/player.h`, `src/models/player.cpp`
-- **Probabilistic models**: `src/models/ball.cpp`, `src/models/probability_model.cpp`
-- **Thread workers**: `src/threads/*.cpp`
-- **Entrypoint & roster init**: `src/main.cpp`
-- **Post-run analysis**: `analysis/gantt_plot.py`, `analysis/stats_analysis.py`
-
----
-
-## 3. Thread model and synchronization
-
-### Thread inventory
-
-The simulator runs **18 tracked thread slots**:
-- 1 bowler
-- 2 batsman slots
-- 10 fielders
-- 1 scheduler
-- 1 umpire
-- 1 logger
-- 1 commentator
-- 1 main
-
-### Synchronization primitives (MatchState)
-
-- `score_mutex`: scoreboard/state updates (`runs`, `wickets`, striker indexes)
-- `ball_mutex`: delivery lifecycle flags (`ball_available`, `ball_in_air`, `result_consumed`)
-- `sched_mutex` + `sched_cv`: over-end handoff bowler ↔ scheduler
-- `zone_cv[ZONE_COUNT]`: zone-based pub-sub wakeup for relevant fielders
-- `result_ready_cv` / `ball_resolved_cv`: fielder resolution coordination
-- `crease_sem` (capacity 2): two active batsman slots
-- `PitchEnd end_mutex[2]`: crease-end lock modeling for run-out state
-- `shutdown_mutex` + `shutdown_cv`: orderly umpire final exit gate
-- `PitchMonitor::mutex`: pitch critical section (one delivery at a time)
-
-### Thread interaction view
-
-```mermaid
-sequenceDiagram
-    participant BW as Bowler
-    participant BT as Batsman(slot0)
-    participant FD as Fielder(winner)
-    participant SC as Scheduler
-    participant LG as Logger
-
-    BW->>BW: Acquire PitchMonitor
-    BW->>BT: signal ball_bowled_cv
-    BT->>FD: broadcast zone_cv[*] if fielding needed
-    FD->>FD: Race for resolve_mutex (fastest reaction wins)
-    FD->>FD: Sets ball_being_resolved=true, clears ball_in_air
-    FD->>FD: Broadcasts ball_resolved_cv (unblocks losers)
-    FD->>FD: Computes outcome, updates score_mutex
-    FD->>BW: signal_result_done() → result_consumed=true → result_ready_cv
-    BW->>BW: Release PitchMonitor
-    BW->>SC: over_complete=true
-    SC->>BW: next_bowler_ready=true
-    BW->>LG: push match events
+.
+├── include/
+│   ├── event.h           # Event types, EventQueue struct, queue API
+│   ├── match_state.h     # MatchState (shared scoreboard + all sync primitives)
+│   ├── player.h          # Player struct, FieldZone enum, role definitions
+│   ├── pitch_monitor.h   # PitchMonitor (mutex protecting the crease)
+│   ├── scheduler.h       # Scheduler API declarations
+│   └── scoreboard.h      # Live scoreboard print helpers
+│
+├── src/
+│   ├── main.cpp                    # Entry point, thread launch/join, innings loop
+│   ├── core/
+│   │   ├── match_state.cpp         # MatchState init/destroy + deadlock helpers
+│   │   ├── event_queue.cpp         # Bounded circular buffer with mutex+cond
+│   │   ├── pitch_monitor.cpp       # Pitch mutex acquire/release
+│   │   └── scoreboard.cpp          # Live terminal scoreboard rendering
+│   ├── threads/
+│   │   ├── bowler_thread.cpp       # Delivers balls, manages overs
+│   │   ├── batsman_thread.cpp      # Faces balls, decides shot, scores runs
+│   │   ├── fielder_thread.cpp      # Reacts to aerial balls, attempts catches/run-outs
+│   │   ├── umpire_thread.cpp       # Officiates, runs Banker's Algorithm deadlock detector
+│   │   ├── scheduler_thread.cpp    # Selects next bowler via FCFS/SJF/Priority
+│   │   ├── logger_thread.cpp       # Single writer to match_log.txt + events.csv
+│   │   └── commentator_thread.cpp  # Generates rich commentary, pipeline producer/consumer
+│   ├── models/
+│   │   ├── ball.cpp                # Ball outcome probability model
+│   │   └── probability_model.cpp   # Fielder outcome probability model
+│   └── utils/
+│       ├── random.cpp              # Weighted random selection helper
+│       └── time_utils.cpp          # Monotonic timestamp helper
+│
+├── analysis/
+│   ├── gantt_plot.py       # Gantt chart generator (per-ball event timeline)
+│   └── stats_analysis.py   # Full statistical comparison across scheduler modes
+│
+├── logs/                   # Generated at runtime (git-ignored)
+└── Makefile
 ```
 
 ---
 
-## 4. End-to-end innings workflow
+## 3. Architecture Overview
+
+```mermaid
+graph TD
+    MAIN["main.cpp\n(orchestrator)"]
+
+    subgraph Threads["Live Threads during an Innings"]
+        BOWLER["Bowler Thread\n(delivers ball)"]
+        BAT0["Batsman Thread 0\n(striker)"]
+        BAT1["Batsman Thread 1\n(non-striker)"]
+        FIELDERS["10 Fielder Threads\n(one per zone)"]
+        UMPIRE["Umpire Thread\n(officiates + deadlock monitor)"]
+        SCHED["Scheduler Thread\n(picks next bowler)"]
+        LOGGER["Logger Thread\n(sole file writer)"]
+        COMMENT["Commentator Thread\n(commentary pipeline)"]
+    end
+
+    subgraph SharedState["Shared State (MatchState)"]
+        MS["score, over, ball\nball_available flag\nball_in_air flag\nmutexes + cond vars\ndeadlock tables"]
+    end
+
+    subgraph Queues["Event Queues (bounded, thread-safe)"]
+        EQ["g_event_queue\n(all threads → Logger)"]
+        CQ["g_commentary_queue\n(Bowler/Batsman/Fielder → Commentator)"]
+    end
+
+    MAIN --> BOWLER
+    MAIN --> BAT0
+    MAIN --> BAT1
+    MAIN --> FIELDERS
+    MAIN --> UMPIRE
+    MAIN --> SCHED
+    MAIN --> LOGGER
+    MAIN --> COMMENT
+
+    BOWLER -->|"writes ball result"| MS
+    BAT0 -->|"reads/writes score"| MS
+    BAT1 -->|"reads/writes score"| MS
+    FIELDERS -->|"compete for zone_cv"| MS
+
+    BOWLER --> EQ
+    BAT0 --> EQ
+    BAT1 --> EQ
+    FIELDERS --> EQ
+    UMPIRE --> EQ
+
+    BOWLER --> CQ
+    BAT0 --> CQ
+    FIELDERS --> CQ
+    COMMENT -->|"reads commentary queue"| CQ
+    COMMENT -->|"pushes EVT_COMMENTARY"| EQ
+
+    LOGGER -->|"drains"| EQ
+    UMPIRE -->|"reads match state"| MS
+```
+
+---
+
+## 4. Thread Design
+
+### 4.1 Bowler Thread
+
+The bowler is the **clock** of the simulation. Each iteration represents one ball delivery.
 
 ```mermaid
 flowchart TD
-    A[Initialize state + players + queues + threads] --> B[For each over up to 20]
-    B --> C[For each legal ball up to 6]
-    C --> D[Generate probabilistic ball outcome]
-    D -->|Wide/No-ball| E[Add extra run; no legal ball increment]
-    D -->|Legal delivery| F[Increment total_balls + update intensity]
-    F --> G[Wake batsman thread]
-    G --> H{Outcome requires fielder?}
-    H -->|No| I[Apply runs/wicket directly]
-    H -->|AERIAL + outside fielder in zone| J[Wake zone/adjacent fielders]
-    H -->|AERIAL + no outside fielder in zone| P["Batsman resolves directly as 4 (60%) or 6 (40%)"]
-    J --> K[One fielder wins resolve_mutex and finalizes]
-    I --> L[Signal bowler result_ready]
-    K --> L
-    P --> L
-    L --> M[End over? scheduler selects next bowler]
-    M --> N{10 wickets or 20 overs?}
-    N -->|No| C
-    N -->|Yes| O[Signal match over, flush queues, join threads, print scorecard]
+    A([Bowler thread starts]) --> B[Acquire PitchMonitor mutex]
+    B --> C[Set ball_available = true\nSignal ball_bowled_cv]
+    C --> D[Wait on result_ready_cv]
+    D --> E{Ball resolved?}
+    E -->|No| D
+    E -->|Yes| F[Push events to both queues]
+    F --> G{Over complete?\n6 balls done}
+    G -->|No| H[Release PitchMonitor\nSleep for next ball]
+    H --> B
+    G -->|Yes| I[Signal sched_cv\nWait for next_bowler_ready]
+    I --> J{Match over?}
+    J -->|No| B
+    J -->|Yes| K([Exit thread])
+```
+
+**Powerplay enforcement:** During overs 1–6, fielders at `COVER` (index 0) and `SQUARE_LEG` (index 8) are forced inside the 30-yard circle. The bowler thread enforces this by directly setting `in30YardZone` on those two fielder objects before each delivery.
+
+---
+
+### 4.2 Batsman Threads
+
+Two batsman threads run simultaneously — striker and non-striker. Only the **striker** resolves the ball outcome; the non-striker watches for run-out opportunities.
+
+```mermaid
+flowchart TD
+    A([Batsman thread starts]) --> B[Acquire crease_sem\n'capacity = 2']
+    B --> C[Wait on ball_bowled_cv]
+    C --> D{Am I the striker?}
+    D -->|No| C
+    D -->|Yes| E[Generate shot: BallOutcome]
+    E --> F{Outcome type?}
+    F -->|DOT/GROUNDED| G[Push runs=0 event\nNo field involvement]
+    F -->|AERIAL| H[Set ball_in_air=true\nSignal zone_cv for ball zone\nWait on result_ready_cv]
+    F -->|BOWLED/LBW/STUMPED| I[Push BATSMAN_OUT\nRelease crease_sem\nExit thread]
+    G --> J[Set result_consumed=true\nSignal result_ready_cv]
+    H --> J
+    J --> K{Wicket or match over?}
+    K -->|No| C
+    K -->|Yes| L([Exit thread])
+```
+
+**Shot probability** is weighted by the batsman's `strike_rate`, `bat_avg`, and `power_index`. Higher-rated batsmen get boosted weights for `WELL_TIMED` and `AERIAL` outcomes and reduced weight for `BOWLED`/`LBW`.
+
+---
+
+### 4.3 Fielder Threads (×10)
+
+Each fielder lives in a specific `FieldZone`. All 10 threads run concurrently and only become active when the ball enters their zone.
+
+```mermaid
+flowchart TD
+    A([Fielder thread starts]) --> B[Wait on zone_cv\nfor my FieldZone]
+    B --> C{ball_in_air == true\nand my zone matches?}
+    C -->|No| B
+    C -->|Yes| D[Compete for resolve_mutex\n'first fielder wins']
+    D --> E{Won the race?}
+    E -->|Lost| F[Release mutex\nGo back to waiting]
+    E -->|Won| G[Call fielder_resolve_aerial\ncompute outcome]
+    G --> H{FielderOutcome?}
+    H -->|CATCH_OUT| I[Signal CATCH_OUT\nPost crease_sem]
+    H -->|DROPPED| J[Compute runs via compute_runs\nPush RUNS_SCORED]
+    H -->|RUN_OUT| K[Push RUN_OUT event]
+    H -->|FOUR/SIX| L[Push FOUR or SIX event]
+    I --> M[Set result_consumed\nSignal result_ready_cv]
+    J --> M
+    K --> M
+    L --> M
+    M --> B
+```
+
+**Zone adjacency:** If the ball lands in a zone adjacent to a fielder's assigned zone (within ±1 in circular order), that fielder is still eligible to attempt the ball. This models realistic diving/running between positions.
+
+---
+
+### 4.4 Umpire Thread
+
+The umpire thread has two responsibilities:
+
+1. **Ball validation** — confirms each delivery, handles no-ball/wide rule enforcement
+2. **Deadlock detection** — runs the Banker's Algorithm after every delivery
+
+```mermaid
+flowchart TD
+    A([Umpire thread starts]) --> B[Wait on ball_resolved_cv]
+    B --> C[Validate delivery\nCheck wide/no-ball conditions]
+    C --> D[Run Banker's Algorithm\non current allocation matrix]
+    D --> E{Unsafe state?}
+    E -->|No| F[Push EVT_LOG_MESSAGE\nContinue]
+    E -->|Yes| G[Push EVT_DEADLOCK_DETECTED\nLog allocation + request tables\nExit with code 2]
+    F --> H{allow_umpire_exit?}
+    H -->|No| B
+    H -->|Yes| I([Exit thread])
 ```
 
 ---
 
-## 5. Scheduling algorithms
+### 4.5 Scheduler Thread
 
-Scheduler is implemented in `src/threads/scheduler_thread.cpp`.
-
-### Bowler scheduling
-
-1. **Round Robin (ALGO_RR)**
-   - Implemented as **phase-quota RR**.
-   - Over mapping:
-     - Overs **1,3** → top-priority bowler
-     - Overs **2,4** → second-priority bowler
-     - Overs **5,16** → RR excluding top two
-     - Overs **17,19** → top-priority bowler
-     - Overs **18,20** → second-priority bowler
-     - Else → normal RR from current bowler
-
-2. **SJF (ALGO_SJF)**
-   - Batsman selection: promotes the batsman with the shortest estimated burst time (`bat_avg / strike_rate × 100`). This is the primary SJF effect.
-   - Bowler rotation under SJF: uses standard Round Robin (`rr_next(current, 5)`). SJF is not applied to bowler selection.
-
-3. **Priority (ALGO_PRIORITY)**
-   - Uses the same phase-quota routing logic as RR variant, seeded from bowler priorities.
-
-### Batting-order scheduling
-
-- **RR/Priority**: FCFS-like, first waiting and not-called-up batsman.
-- **SJF batting order**: chooses batsman with shortest estimated burst:
-
-$$
-\text{burst} = \frac{\text{batAvg}}{\text{strikeRate}} \times 100
-$$
-
-This SJF burst estimate is used for batting-order selection only.
-
----
-
-## 6. Probability and cricket mechanics model
-
-### 6.1 Ball outcome distribution
-
-In `src/models/ball.cpp`, each legal delivery samples one of 9 discrete outcomes:
-
-- `DOT`
-- `GROUNDED`
-- `WELL_TIMED`
-- `AERIAL`
-- `BOWLED`
-- `WIDE`
-- `NO_BALL`
-- `LBW`
-- `STUMPED`
-
-Base weight vector:
-
-$$w = [30, 36, 18, 8, 2, 4, 3, 2, 1]$$
-
-Weights are then adjusted by:
-- **Match intensity** (death-over aggression boosts attacking outcomes)
-- **Batsman strike rate**
-- **Power index**
-- **Batting average**
-- **Tailender penalty** for lower-order indices
-
-Final outcome is sampled from normalized discrete cumulative weights.
-
-### Match intensity mapping
-
-The bowler thread computes `match_intensity` inline per legal ball as follows:
-
-```cpp
-if      (cur_over >= 19) g_match.match_intensity = 10;
-else if (cur_over >= 15) g_match.match_intensity = 7;
-else if (cur_over >= 10) g_match.match_intensity = 4;
-else                     g_match.match_intensity = cur_over / 3;
+```mermaid
+flowchart TD
+    A([Scheduler thread starts]) --> B[Wait on sched_cv\nfor over_complete signal]
+    B --> C{Which algorithm?}
+    C -->|FCFS / Round Robin| D[rr_next_excluding\nskip top-2 priority bowlers\nexcept in overs 17-20]
+    C -->|SJF| E[Pick bowler with\nlowest estimated_duration\namong available]
+    C -->|Priority| F[Pick highest priority bowler\nexcluding previous bowler]
+    D --> G[Set current_bowler_idx\nSet next_bowler_ready = true\nSignal sched_cv]
+    E --> G
+    F --> G
+    G --> H{Match over?}
+    H -->|No| B
+    H -->|Yes| I([Exit thread])
 ```
 
-| Current over (0-indexed) | `match_intensity` |
-|--------------------------|-------------------|
-| ≥ 19 (over 20)           | 10                |
-| ≥ 15 (overs 16–19)       | 7                 |
-| ≥ 10 (overs 11–15)       | 4                 |
-| < 10 (overs 1–10)        | `cur_over / 3` (0–3) |
-
-### 6.2 Aerial-ball fielder resolution
-
-In `src/models/probability_model.cpp`, aerial outcomes are sampled from:
-
-$$[\text{CATCH}, \text{DROP}, \text{RUNOUT}, \text{FOUR}, \text{SIX}] = [8, 10, 12, 38, 32]$$
-
-These weights sum to **100**, so they can be interpreted directly as base percentages
-before skill/reaction adjustments $(8 + 10 + 12 + 38 + 32 = 100)$.
-
-Then adjusted by:
-- `dive_ability`
-- `speed`
-- `reaction_ms`
-
-This yields probabilistic but skill-sensitive fielding outcomes.
-
-### 6.3 Run computation for grounded/well-timed balls
-
-`src/threads/fielder_thread.cpp::compute_runs()` derives runs from batting vs fielding scores with additive random noise:
-- Batting score uses `power_index`, `strike_rate`, `bat_avg`
-- Field score uses `speed`, `accuracy`, `dive_ability`
-- Net score bucketed into 0/1/2/3 runs (well-timed adds +1 bias before boundary handling)
-
-### 6.4 Extras and special laws
-
-- **Wide**: +1 run, legal-ball counter unchanged.
-- **No-ball**: +1 run, legal-ball counter unchanged, `free_hit_active=true` for next legal delivery.
-- **Free hit logic**:
-  - protects against: bowled, LBW, stumped
-  - catch remains valid (as modeled)
-- **Overthrow**: on failed run-out attempt, 20% chance of 1–3 extra runs.
-- **Powerplay fielding**:
-  - Overs 1–6: only 2 fielders outside 30-yard circle.
-  - Overs 7–20: all fielders outside (per current model implementation).
+**Death over specialisation (overs 17–20):** Under all algorithms, the two highest-`priority` bowlers are reserved for death overs. The scheduler pre-computes these two indices at the start of the innings and always selects between them in the final four overs.
 
 ---
 
-## 7. Deadlock detection design
-
-The umpire (`src/threads/umpire_thread.cpp`) polls every **150 ms** and runs a Banker-style safety check over tracked resources.
-
-### Resources tracked
-
-- `SCORE_MUTEX`
-- `BALL_MUTEX`
-- `SCHED_MUTEX`
-- `END_MUTEX_0`
-- `END_MUTEX_1`
-- `CREASE_SEM` (capacity 2)
-- `FIELDER_RESOLVE_MUTEX`
-- `PITCH_MONITOR_MUTEX`
-- `SHUTDOWN_MUTEX`
-
-### Matrices maintained (`MatchState`)
-
-- `deadlock_allocation[THREAD][RESOURCE]`
-- `deadlock_request[THREAD][RESOURCE]`
-- `deadlock_available[RESOURCE]`
-
-Each wrapped lock/cond/sem call updates request/allocation bookkeeping.
-
-### On deadlock detection
-
-- Umpire writes `logs/deadlock_log.txt` with trigger info + full matrices/grids.
-- Process exits fail-fast with status code `2` (`_Exit(EXIT_CODE_DEADLOCK)`).
-
-### Demo mode
-
-`--deadlock-demo` intentionally creates lock-order inversion between bowler and scheduler to demonstrate detector behavior.
-Specifically, bowler acquires `BALL_MUTEX -> SCHED_MUTEX` while scheduler attempts
-`SCHED_MUTEX -> BALL_MUTEX`, creating a circular-wait scenario.
-
----
-
-## 8. Logging and analytics pipeline
-
-### Logging pipeline
+### 4.6 Logger & Commentator Threads
 
 ```mermaid
 flowchart LR
-    T[Gameplay threads] --> CQ[g_commentary_queue]
-    T --> EQ[g_event_queue]
-    CQ --> C[commentator_thread]
-    C -->|EVT_COMMENTARY| EQ
-    EQ --> L[logger_thread]
-    L --> TXT[logs/match_log.txt]
-    L --> CSV[logs/events.csv]
-    L --> CM[logs/commentary_log.txt]
+    subgraph Producers
+        B2[Bowler]
+        Ba[Batsman]
+        Fi[Fielder]
+        Um[Umpire]
+    end
+
+    EQ[(g_event_queue\nCapacity: 256)]
+    CQ[(g_commentary_queue\nCapacity: 256)]
+
+    B2 -->|all events| EQ
+    Ba -->|all events| EQ
+    Fi -->|all events| EQ
+    Um -->|all events| EQ
+
+    B2 -->|commentary events| CQ
+    Ba -->|commentary events| CQ
+    Fi -->|commentary events| CQ
+
+    COMM["Commentator Thread\n(consumer of CQ\nproducer to EQ)"]
+    LOG["Logger Thread\n(sole consumer of EQ)"]
+
+    CQ --> COMM
+    COMM -->|EVT_COMMENTARY| EQ
+    EQ --> LOG
+
+    LOG -->|write| TXT["logs/match_log.txt"]
+    LOG -->|write| CSV["logs/events.csv"]
+    LOG -->|write| CMT["logs/commentary_log.txt"]
 ```
 
-### Output artifacts
-
-- `logs/match_log.txt`: structured human-readable event log
-- `logs/events.csv`: machine-readable event stream for plotting/statistics
-- `logs/commentary_log.txt`: generated narrative commentary
-- `logs/deadlock_log.txt`: only when deadlock is detected
-
-### Analysis scripts
-
-- `analysis/gantt_plot.py` → thread/event timeline plots
-- `analysis/stats_analysis.py` → comparative run statistics (e.g., FCFS vs SJF)
+The logger is the **only** thread permitted to write to disk, eliminating all file-write races.
 
 ---
 
-## 9. Build, run, and analysis
+## 5. Synchronisation & Concurrency
+
+### Primitives in use
+
+| Primitive | Used for |
+|---|---|
+| `pthread_mutex_t score_mutex` | Protect score, over, ball counters |
+| `pthread_mutex_t ball_mutex` | Protect `ball_available`, `ball_in_air`, `result_consumed` |
+| `pthread_mutex_t sched_mutex` | Protect scheduler state (`over_complete`, `next_bowler_ready`) |
+| `pthread_mutex_t shutdown_mutex` | Coordinate graceful thread shutdown |
+| `pthread_mutex_t resolve_mutex` | Ensure only one fielder resolves an aerial ball |
+| `pthread_mutex_t deadlock_mutex` | Protect Banker's Algorithm tables |
+| `pthread_cond_t ball_bowled_cv` | Batsmen wake when a ball is delivered |
+| `pthread_cond_t zone_cv[8]` | One condition per FieldZone; fielders wake only for their zone |
+| `pthread_cond_t result_ready_cv` | Bowler wakes when ball outcome is resolved |
+| `pthread_cond_t ball_resolved_cv` | Umpire wakes after each delivery |
+| `pthread_cond_t sched_cv` | Scheduler wakes at end of each over |
+| `sem_t crease_sem` | Counting semaphore (capacity=2) — exactly two batsmen on crease |
+| `EventQueue.mutex + not_empty + not_full` | Classic bounded-buffer producer-consumer |
+
+### Ball lifecycle (per delivery)
+
+```mermaid
+sequenceDiagram
+    participant Bowler
+    participant MatchState
+    participant Batsman
+    participant Fielder
+    participant Umpire
+
+    Bowler->>MatchState: Lock ball_mutex\nSet ball_available=true\nSignal ball_bowled_cv
+    Batsman->>MatchState: Wake on ball_bowled_cv\nGenerate BallOutcome
+    alt Aerial shot
+        Batsman->>MatchState: Set ball_in_air=true\nSignal zone_cv[zone]
+        Fielder->>MatchState: Wake on zone_cv\nCompete for resolve_mutex
+        Fielder->>MatchState: Resolve outcome\nSet result_consumed=true\nSignal result_ready_cv
+    else Grounded / Dot / Wicket
+        Batsman->>MatchState: Set result_consumed=true\nSignal result_ready_cv
+    end
+    Bowler->>MatchState: Wake on result_ready_cv\nRead outcome, update score
+    Bowler->>MatchState: Signal ball_resolved_cv
+    Umpire->>MatchState: Wake on ball_resolved_cv\nRun deadlock check
+```
+
+---
+
+## 6. Scheduling Algorithms
+
+The simulator demonstrates three CPU-scheduling algorithms applied to **bowler selection**:
+
+### FCFS / Round-Robin (Phase Quota)
+
+Each bowler gets turns in sequence. The top-2 priority bowlers are held back until overs 17–20 (death overs). Outside death overs, `rr_next_excluding` cycles through the remaining three bowlers.
+
+```
+Overs 1–16:  Bowler[0] → Bowler[1] → Bowler[2] → Bowler[0] → ...
+             (skipping top-2 priority bowlers)
+Overs 17–20: Bowler[top1] → Bowler[top2] → Bowler[top1] → ...
+```
+
+### Shortest Job First (SJF)
+
+Each bowler carries an `estimated_duration` (proxy for balls-to-wicket). The scheduler picks the bowler with the **lowest** estimated duration among those not currently bowling. If two are equal, lower index wins.
+
+```
+Priority: min(estimated_duration) among available bowlers
+```
+
+### Priority Scheduling
+
+Each bowler has an integer `priority` (higher = better). The scheduler selects the highest-priority bowler who is not the same as the previous bowler (to avoid consecutive overs). The top-2 priority bowlers are still reserved for death overs under this mode.
+
+---
+
+## 7. Event System
+
+### Event Types
+
+```mermaid
+graph LR
+    subgraph Ball Events
+        BB[EVT_BALL_BOWLED]
+        NB[EVT_NO_BALL]
+        WD[EVT_WIDE]
+        FH[EVT_FREE_HIT]
+    end
+    subgraph Outcome Events
+        RS[EVT_RUNS_SCORED]
+        F4[EVT_FOUR]
+        F6[EVT_SIX]
+        OT[EVT_OVERTHROW]
+        IA[EVT_BALL_IN_AIR]
+    end
+    subgraph Dismissal Events
+        CO[EVT_CATCH_OUT]
+        RO[EVT_RUN_OUT]
+        BO[EVT_BATSMAN_OUT]
+    end
+    subgraph Control Events
+        OC[EVT_OVER_COMPLETE]
+        MO[EVT_MATCH_OVER]
+        DL[EVT_DEADLOCK_DETECTED]
+        LM[EVT_LOG_MESSAGE]
+        CM[EVT_COMMENTARY]
+    end
+```
+
+### EventQueue — Bounded Circular Buffer
+
+```
+Capacity: 256 events (EVENT_QUEUE_CAPACITY)
+
+  head →  [ E0 | E1 | E2 | ... | E255 ]  ← tail
+           ↑ consumer pops here          ↑ producer pushes here
+
+Mutex:     queue.mutex
+Wake producer: not_full  (signal when count < 256)
+Wake consumer: not_empty (signal when count > 0)
+Shutdown:  queue.shutdown flag — unblocks all waiters
+```
+
+Every push/pop is wrapped in `pthread_mutex_lock` + `pthread_cond_wait` to guarantee thread safety and prevent busy-waiting.
+
+---
+
+## 8. Deadlock Detection
+
+The umpire thread implements the **Banker's Algorithm** (resource-allocation graph variant) after every delivery.
+
+### Resources tracked (9 total)
+
+| ID | Resource |
+|---|---|
+| 0 | `SCORE_MUTEX` |
+| 1 | `BALL_MUTEX` |
+| 2 | `SCHED_MUTEX` |
+| 3 | `END_MUTEX_0` |
+| 4 | `END_MUTEX_1` |
+| 5 | `CREASE_SEM` (capacity=2) |
+| 6 | `FIELDER_RESOLVE_MUTEX` |
+| 7 | `PITCH_MONITOR_MUTEX` |
+| 8 | `SHUTDOWN_MUTEX` |
+
+### Threads tracked (18 total)
+
+1 Bowler + 2 Batsmen + 10 Fielders + 1 Umpire + 1 Scheduler + 1 Logger + 1 Commentator + 1 Main
+
+### Algorithm flow
+
+```mermaid
+flowchart TD
+    A[After each delivery:\nUmpire wakes] --> B[Copy Allocation, Request,\nAvailable matrices]
+    B --> C[Mark all threads as 'unfinished']
+    C --> D{Find an unfinished thread T\nwhere Request_T ≤ Available}
+    D -->|Found| E[Simulate T finishing:\nAvailable += Allocation_T\nMark T finished]
+    E --> D
+    D -->|None found| F{Any unfinished threads left?}
+    F -->|No| G[Safe state — continue]
+    F -->|Yes| H[UNSAFE STATE DETECTED\nLog full allocation table\nPush EVT_DEADLOCK_DETECTED\nExit code 2]
+```
+
+**Demo mode:** Run with `--deadlock-demo` to inject artificially high resource contention, making a deadlock-detection event very likely within the first few overs.
+
+---
+
+## 9. Probability & Simulation Models
+
+### Ball Outcome Model (`src/models/ball.cpp`)
+
+Base weights over 9 outcomes:
+
+| Outcome | Base Weight | Notes |
+|---|---|---|
+| DOT | 30 | Reduced by `match_intensity / 2` in death overs |
+| GROUNDED | 36 | Standard ground shot for 1–3 runs |
+| WELL_TIMED | 18 | Increased by `match_intensity` |
+| AERIAL | 8 | Slight boost in high-intensity phases |
+| BOWLED | 2 | — |
+| WIDE | 4 | — |
+| NO_BALL | 3 | — |
+| LBW | 2 | — |
+| STUMPED | 1 | — |
+
+Batsman stats (`strike_rate`, `power_index`, `bat_avg`) then shift these weights individually. A batsman with `power_index ≥ 8` gets a large AERIAL/WELL_TIMED boost and a BOWLED/STUMPED reduction.
+
+### Fielder Outcome Model (`src/models/probability_model.cpp`)
+
+Base weights for aerial ball:
+
+| Outcome | Base Weight |
+|---|---|
+| CATCH_OUT | 8 |
+| DROPPED | 10 |
+| RUN_OUT_ATTEMPT | 12 |
+| FOUR (over boundary) | 38 |
+| SIX (over boundary) | 32 |
+
+Modified by `dive_ability`, `speed`, and `reaction_ms`. A fielder with `dive_ability ≥ 8` gains +12 to CATCH weight. Faster reaction time reduces FOUR/SIX weights.
+
+### Run Computation (`src/threads/fielder_thread.cpp`)
+
+```
+batting_score = power_index × 0.5 + (strike_rate / 100) × 3.0 + (bat_avg / 50) × 2.0
+field_score   = speed × 0.5 + accuracy × 0.3 + dive_ability × 0.4
+net           = batting_score − field_score + noise(−1, +1)
+
+net < −1.0  → 0 runs
+net < 1.5   → 1 run
+net < 3.0   → 2 runs
+net < 4.5   → 3 runs
+net ≥ 4.5   → 4 runs (boundary)
+```
+
+---
+
+## 10. Output & Logging
+
+Three log files are written to `logs/` during a run:
+
+| File | Contents |
+|---|---|
+| `logs/match_log.txt` | Human-readable ball-by-ball log with timestamps |
+| `logs/events.csv` | Structured CSV: `timestamp_us, event_type, over, ball, bowler_id, batsman_id, fielder_id, runs` |
+| `logs/commentary_log.txt` | Rich auto-generated commentary lines |
+
+When run without a flag (default mode), the simulator forks and runs **three separate child processes** (FCFS, SJF, Priority), saving their CSV outputs as:
+- `logs/events_fcfs.csv`
+- `logs/events_sjf.csv`
+- `logs/events_priority.csv`
+
+These three files feed the analysis scripts.
+
+---
+
+## 11. Analysis Tools
+
+### Gantt Chart (`analysis/gantt_plot.py`)
+
+Reads the two or three CSV files and plots a Gantt-style chart: each row is a ball delivery, coloured by match phase (Powerplay / Middle / Death). Saves to `docs/gantt_fcfs.png`, `docs/gantt_sjf.png`.
+
+### Stats Analysis (`analysis/stats_analysis.py`)
+
+Generates a multi-panel matplotlib figure comparing FCFS vs SJF vs Priority across:
+
+- Run rate progression per over
+- Wicket distribution by type (caught, bowled, LBW, run-out, stumped)
+- Boundary count (fours vs sixes) per phase
+- Dismissal colour map
+
+Output saved to `docs/analysis.png`.
+
+**Dependencies:**
+```bash
+pip install matplotlib pandas numpy
+```
+
+---
+
+## 12. Build & Run
+
+### Prerequisites
+
+- `g++` with C++17 support
+- POSIX threads (`-lpthread`) — standard on Linux/macOS
+- Python 3.8+ with `matplotlib`, `pandas`, `numpy` (for analysis only)
 
 ### Build
 
 ```bash
-cd <project-root>
-make
+make          # Compiles all sources → ./t20_simulator
 ```
 
-### Run modes
+### Run
 
 ```bash
-# Dual run: calls fork()+execl() twice (once with --fcfs, once with --sjf).
-# After each child exits (waitpid), the parent copies events.csv, match_log.txt,
-# and commentary_log.txt to events_fcfs.csv / events_sjf.csv etc.
-# Intermediate files are deleted after copying.
+# Default: forks 3 child processes (FCFS + SJF + Priority), saves all CSVs
 ./t20_simulator
 
-./t20_simulator --fcfs          # single fcfs run
-./t20_simulator --sjf         # single SJF run
+# Single-algorithm runs
+./t20_simulator --fcfs          # Round-robin bowler scheduling
+./t20_simulator --sjf           # Shortest Job First bowler scheduling
+./t20_simulator --priority      # Priority-based bowler scheduling
+
+# Deadlock demo: high-contention mode to trigger Banker's Algorithm detection
 ./t20_simulator --deadlock-demo
+
+# Makefile shortcuts
+make run          # build + run --fcfs
+make run-sjf      # build + run --sjf
 ```
 
-### Generate plots
+### Generate analysis charts
 
 ```bash
 make analysis
+# Produces:
+#   docs/gantt_fcfs.png
+#   docs/gantt_sjf.png
+#   docs/analysis.png
 ```
 
-Expected plot outputs:
-- `docs/gantt_fcfs.png`
-- `docs/gantt_sjf.png`
-- `docs/analysis.png`
+### Clean
+
+```bash
+make clean    # removes build/, t20_simulator, logs/*.csv, logs/*.txt, docs/*.png
+```
 
 ---
 
-## 10. Data structures (core structs)
+## 13. Key OS Concepts Demonstrated
 
-### `Player` (include/player.h)
-
-Contains:
-- Identity: `id`, `name`, `role`
-- Batting stats: `runs_scored`, `balls_faced`, `fours`, `sixes`, `is_out`, `out_type`
-- Bowling stats: `balls_bowled`, `runs_given`, `wickets_taken`, `overs_bowled`
-- Scheduler metadata: `priority`, `estimated_duration`, `crease_order`, `called_up`
-  - `crease_order`: set to `g_crease_counter++` at the moment the player walks to the crease (via `batsman_thread` on direct wickets, or `fielder_thread` via `bring_new_batsman()` on caught/run-out). Openers get order 1 and 2 at init; `g_crease_counter` starts at 3.
-- Skill vectors:
-  - Batting: `bat_avg`, `strike_rate`, `power_index`
-  - Fielding: `dive_ability`, `accuracy`, `speed`
-- Positioning: `field_zone`, `in30YardZone`
-
-### `MatchState` (include/match_state.h)
-
-Global shared state containing:
-- Scoreboard counters (`runs`, `wickets`, `over`, `ball`, `total_balls`)
-- Striker/non-striker pointers and batting progression
-- All mutexes/CVs/semaphores
-- Scheduler handoff and mode fields
-- Free-hit and ball-state flags
-- Deadlock accounting matrices and thread/resource metadata
-- Match intensity and current bowler indices
-
-### `Event` and `EventQueue` (include/event.h)
-
-- `Event`: typed event payload with actor IDs, run info, ball coordinates, zone, and text message.
-- `EventQueue`: bounded circular buffer (`capacity=256`) with mutex + `not_empty`/`not_full` CVs and shutdown semantics.
+| Concept | Where it appears |
+|---|---|
+| **POSIX Threads** | All 7+ threads per innings via `pthread_create` / `pthread_join` |
+| **Mutex + Condition Variables** | Ball lifecycle, score updates, scheduler handoff, shutdown |
+| **Counting Semaphore** | `crease_sem` — exactly 2 batsmen on crease at all times |
+| **Producer-Consumer Pattern** | `EventQueue` (bounded circular buffer, 256 capacity) |
+| **Pipeline Message-Passing** | Commentator consumes `g_commentary_queue`, produces to `g_event_queue` |
+| **Banker's Algorithm** | Umpire thread runs safety check after every delivery |
+| **CPU Scheduling Algorithms** | FCFS/Round-Robin, SJF, Priority — applied to bowler rotation |
+| **Fork / Exec** | `main.cpp` forks child processes for multi-algorithm comparison runs |
+| **Race Condition Prevention** | `resolve_mutex` ensures only one fielder resolves an aerial ball |
+| **Monitor Pattern** | `PitchMonitor` wraps crease mutex with acquire/release semantics |
+| **Single-Writer Logging** | Logger is sole thread writing to disk — no concurrent file access |
 
 ---
 
-## 11. Assumptions implemented
-
-1. **Single innings only** (India batting).
-2. **Fixed rosters**: 11 batsmen, 5 bowlers, 10 fielders.
-3. **Simulated clock via `usleep()`** for pacing.
-4. **Two permanent batsman thread slots.** Slot 0 (striker) processes all ball outcomes. Slot 1 (non-striker) wakes on `ball_bowled_cv`, finds `thread_slot != 0`, releases `ball_mutex`, sleeps 20 ms, and loops. The non-striker never calls any outcome-processing code.
-5. **Persistent fielder threads** awakened by zone-based condition broadcasts.
-6. **Periodic deadlock polling** by umpire every 150 ms.
-7. **Discrete weighted probability model** for ball and fielding outcomes.
-8. **Time-invariant skill parameters** per player during innings.
-9. **Overthrow probability fixed at 20%** for failed run-out path.
-10. **Powerplay field restrictions**: Overs 1–6: fielders 0 (J. Roy, Cover) and 8 (T. Banton, Square Leg) placed outside the 30-yard circle; remaining 8 inside (`in30YardZone = true`). Overs 7–20: all 10 fielders set to `in30YardZone = false`. Updated per legal ball inside the bowler thread under `ball_mutex`.
-
----
-
-## Notes
-
-This repository is intentionally designed as an **OS-concepts-to-domain mapping** project. Its strongest value is not only cricket simulation, but also demonstrable patterns in:
-- lock ordering and contention
-- producer-consumer pipelines
-- scheduling policy comparison
-- deadlock detection and fail-fast recovery behavior
+*Simulation is stochastic — no two matches are identical.*
