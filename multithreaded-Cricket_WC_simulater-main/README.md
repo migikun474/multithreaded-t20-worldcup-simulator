@@ -1,6 +1,6 @@
 # 🏏 Multithreaded T20 Cricket World Cup Simulator
 
-> **Course:** Operating Systems (CSC-204)  
+> 
 > **Language:** C++17 with POSIX Threads  
 > **Match:** India 🇮🇳 vs England 🏴󠁧󠁢󠁥󠁮󠁧󠁿 — T20 World Cup Final
 
